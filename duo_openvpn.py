@@ -1,40 +1,45 @@
 #!/usr/bin/env python
-#
-# duo_openvpn.py
-# Duo OpenVPN
-# Copyright 2013 Duo Security, Inc.
 
-__version__ = '2.2'
+"""
+Low level functions for generating Duo Web API calls and parsing results.
+"""
+from __future__ import absolute_import
+from __future__ import print_function
+import six
+
+__version__ = '3.1.0'
 
 import base64
+import collections
+import copy
+import datetime
 import email.utils
-import httplib
+import hashlib
+import hmac
+import json
 import os
 import socket
+import ssl
 import sys
 import syslog
-import urllib
-
-def log(msg):
-    msg = 'Duo OpenVPN: %s' % msg
-    syslog.syslog(msg)
 
 try:
-    import hashlib
-    import hmac
-    import json
-    from https_wrapper import CertValidatingHTTPSConnection
-except ImportError, e:
-    log('ImportError: %s' % e)
-    log('Please make sure you\'re running Python 2.6 or newer')
-    raise
+    # For the optional demonstration CLI program.
+    import argparse
+except ImportError as e:
+    argparse_error = e
+    argparse = None
 
-API_RESULT_AUTH   = 'auth'
-API_RESULT_ALLOW  = 'allow'
-API_RESULT_DENY   = 'deny'
-API_RESULT_ENROLL = 'enroll'
+try:
+    # Only needed if signing requests with timezones other than UTC.
+    import pytz
+except ImportError as e:
+    pytz_error = e
+
+from https_wrapper import CertValidatingHTTPSConnection
 
 DEFAULT_CA_CERTS = os.path.join(os.path.dirname(__file__), 'ca_certs.pem')
+
 
 def canon_params(params):
     """
@@ -44,10 +49,11 @@ def canon_params(params):
     # http://tools.ietf.org/html/rfc5849#section-3.4.1.3.2
     args = []
     for (key, vals) in sorted(
-        (urllib.quote(key, '~'), vals) for (key, vals) in params.items()):
-        for val in sorted(urllib.quote(val, '~') for val in vals):
+            (six.moves.urllib.parse.quote(key, '~'), vals) for (key, vals) in list(params.items())):
+        for val in sorted(six.moves.urllib.parse.quote(val, '~') for val in vals):
             args.append('%s=%s' % (key, val))
     return '&'.join(args)
+
 
 def canonicalize(method, host, uri, params, date, sig_version):
     """
@@ -68,16 +74,25 @@ def canonicalize(method, host, uri, params, date, sig_version):
     ]
     return '\n'.join(canon)
 
+
 def sign(ikey, skey, method, host, uri, date, sig_version, params):
     """
     Return basic authorization header line with a Duo Web API signature.
     """
     canonical = canonicalize(method, host, uri, params, date, sig_version)
-    if isinstance(skey, unicode):
+    if isinstance(skey, six.text_type):
         skey = skey.encode('utf-8')
+    if isinstance(canonical, six.text_type):
+        canonical = canonical.encode('utf-8')
     sig = hmac.new(skey, canonical, hashlib.sha1)
     auth = '%s:%s' % (ikey, sig.hexdigest())
-    return 'Basic %s' % base64.b64encode(auth)
+    if isinstance(auth, six.text_type):
+        auth = auth.encode('utf-8')
+    b64 = base64.b64encode(auth)
+    if not isinstance(b64, six.text_type):
+        b64 = b64.decode('utf-8')
+    return 'Basic %s' % b64
+
 
 def normalize_params(params):
     """
@@ -87,23 +102,52 @@ def normalize_params(params):
     # urllib cannot handle unicode strings properly. quote() excepts,
     # and urlencode() replaces them with '?'.
     def encode(value):
-        if isinstance(value, unicode):
+        if isinstance(value, six.text_type):
             return value.encode("utf-8")
         return value
+
     def to_list(value):
-        if value is None or isinstance(value, basestring):
+        if value is None or isinstance(value, six.string_types):
             return [value]
         return value
     return dict(
         (encode(key), [encode(v) for v in to_list(value)])
-        for (key, value) in params.items())
+        for (key, value) in list(params.items()))
+
+
+def success(control):
+    log('writing success code to %s' % control)
+
+    f = open(control, 'w')
+    f.write('1')
+    f.close()
+
+    sys.exit(0)
+
+
+def failure(control):
+    log('writing failure code to %s' % control)
+
+    f = open(control, 'w')
+    f.write('0')
+    f.close()
+
+    sys.exit(1)
+
+
+def log(msg):
+    msg = 'Duo OpenVPN: %s' % msg
+    syslog.syslog(msg)
+
 
 class Client(object):
-    sig_version = 1
+    sig_version = 2
 
     def __init__(self, ikey, skey, host,
                  ca_certs=DEFAULT_CA_CERTS,
-                 sig_timezone='UTC', user_agent=None):
+                 sig_timezone='UTC',
+                 user_agent=('Duo API Python/' + __version__),
+                 timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
         """
         ca_certs - Path to CA pem file.
         """
@@ -117,7 +161,12 @@ class Client(object):
         self.ca_certs = ca_certs
         self.user_agent = user_agent
         self.set_proxy(host=None, proxy_type=None)
-        self.timeout = socket._GLOBAL_DEFAULT_TIMEOUT
+
+        # Default timeout is a sentinel object
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+            self.timeout = timeout
+        else:
+            self.timeout = float(timeout)
 
     def set_proxy(self, host, port=None, headers=None,
                   proxy_type='CONNECT'):
@@ -136,14 +185,22 @@ class Client(object):
 
     def api_call(self, method, path, params):
         """
-        Call a Duo API method. Return a (status, reason, data) tuple.
+        Call a Duo API method. Return a (response, data) tuple.
 
         * method: HTTP request method. E.g. "GET", "POST", or "DELETE".
         * path: Full path of the API endpoint. E.g. "/auth/v2/ping".
         * params: dict mapping from parameter name to stringified value.
         """
         params = normalize_params(params)
-        now = email.utils.formatdate()
+
+        if self.sig_timezone == 'UTC':
+            now = email.utils.formatdate()
+        elif pytz is None:
+            raise pytz_error
+        else:
+            d = datetime.datetime.now(pytz.timezone(self.sig_timezone))
+            now = d.strftime("%a, %d %b %Y %H:%M:%S %z")
+
         auth = sign(self.ikey,
                     self.skey,
                     method,
@@ -163,11 +220,12 @@ class Client(object):
 
         if method in ['POST', 'PUT']:
             headers['Content-type'] = 'application/x-www-form-urlencoded'
-            body = urllib.urlencode(params, doseq=True)
+            body = six.moves.urllib.parse.urlencode(params, doseq=True)
             uri = path
         else:
             body = None
-            uri = path + '?' + urllib.urlencode(params, doseq=True)
+            uri = path + '?' + \
+                six.moves.urllib.parse.urlencode(params, doseq=True)
 
         return self._make_request(method, uri, body, headers)
 
@@ -192,9 +250,14 @@ class Client(object):
 
         # Create outer HTTP(S) connection.
         if self.ca_certs == 'HTTP':
-            conn = httplib.HTTPConnection(host, port)
+            conn = six.moves.http_client.HTTPConnection(host, port)
         elif self.ca_certs == 'DISABLE':
-            conn = httplib.HTTPSConnection(host, port)
+            kwargs = {}
+            if hasattr(ssl, '_create_unverified_context'):
+                # httplib.HTTPSConnection validates certificates by
+                # default in Python 2.7.9+.
+                kwargs['context'] = ssl._create_unverified_context()
+            conn = six.moves.http_client.HTTPSConnection(host, port, **kwargs)
         else:
             conn = CertValidatingHTTPSConnection(host,
                                                  port,
@@ -205,11 +268,11 @@ class Client(object):
 
         # Configure CONNECT proxy tunnel, if any.
         if self.proxy_type == 'CONNECT':
-            if hasattr(conn, 'set_tunnel'): # 2.7+
+            if hasattr(conn, 'set_tunnel'):  # 2.7+
                 conn.set_tunnel(self.host,
                                 api_port,
                                 self.proxy_headers)
-            elif hasattr(conn, '_set_tunnel'): # 2.6.3+
+            elif hasattr(conn, '_set_tunnel'):  # 2.6.3+
                 # pylint: disable=E1103
                 conn._set_tunnel(self.host,
                                  api_port,
@@ -255,6 +318,8 @@ class Client(object):
             error.reason = response.reason
             error.data = data
             raise error
+        if not isinstance(data, six.text_type):
+            data = data.decode('utf-8')
         if response.status != 200:
             try:
                 data = json.loads(data)
@@ -267,13 +332,13 @@ class Client(object):
                         ))
                     else:
                         raise_error('Received %s %s' % (
-                                response.status,
+                            response.status,
                             data['message'],
                         ))
             except (ValueError, KeyError, TypeError):
                 pass
             raise_error('Received %s %s' % (
-                    response.status,
+                response.status,
                     response.reason,
             ))
         try:
@@ -284,130 +349,109 @@ class Client(object):
         except (ValueError, KeyError, TypeError):
             raise_error('Received bad response: %s' % data)
 
-def success(control):
-    log('writing success code to %s' % control)
 
-    f = open(control, 'w')
-    f.write('1')
-    f.close()
+def output_response(response, data, headers=None):
+    """
+    Print response, parsed, sorted, and pretty-printed if JSON
+    """
+    if not headers:
+        headers = []
+    print(response.status, response.reason)
+    for header in headers:
+        val = response.getheader(header)
+        if val is not None:
+            print('%s: %s' % (header, val))
+    try:
+        if not isinstance(data, six.text_type):
+            data = data.decode('utf-8')
+        data = json.loads(data)
+        data = json.dumps(data, sort_keys=True, indent=4)
+    except ValueError:
+        pass
+    print(data)
 
-    sys.exit(0)
 
-def failure(control):
-    log('writing failure code to %s' % control)
-
-    f = open(control, 'w')
-    f.write('0')
-    f.close()
-
-    sys.exit(1)
-
-def preauth(client, control, username):
-    log('pre-authentication for %s' % username)
-
-    response = client.json_api_call('POST', '/rest/v1/preauth', {
-            'user': username,
-    })
-
-    result = response.get('result')
-    if result == API_RESULT_AUTH:
-        return response['factors'].get('default')
-
-    status = response.get('status')
-    if not status:
-        log('invalid API response: %s' % response)
-        failure(control)
-
-    if result == API_RESULT_ENROLL:
-        log('user %s is not enrolled: %s' % (username, status))
-        failure(control)
-    elif result == API_RESULT_DENY:
-        log('preauth failure for %s: %s' % (username, status))
-        failure(control)
-    elif result == API_RESULT_ALLOW:
-        log('preauth success for %s: %s' % (username, status))
-        success(control)
-    else:
-        log('unknown preauth result: %s' % result)
-        failure(control)
-
-def auth(client, control, username, password, ipaddr):
-    log('authentication for %s' % username)
-
-    response = client.json_api_call('POST', '/rest/v1/auth', {
-        'user': username,
-        'factor': 'auto',
-        'auto': password,
-        'ipaddr': ipaddr,
-    })
-
-    result = response.get('result')
-    status = response.get('status')
-
-    if not result or not status:
-        log('invalid API response: %s' % response)
-        failure(control)
-
-    if result == API_RESULT_ALLOW:
-        log('auth success for %s: %s' % (username, status))
-        success(control)
-    elif result == API_RESULT_DENY:
-        log('auth failure for %s: %s' % (username, status))
-        failure(control)
-    else:
-        log('unknown auth result: %s' % result)
-        failure(control)
-
-def main(Client=Client, environ=os.environ):
+def main():
+    environ = os.environ
     control = environ.get('control')
     username = environ.get('username')
     password = environ.get('password')
     ipaddr = environ.get('ipaddr', '0.0.0.0')
 
+    ikey = environ.get('ikey')
+    skey = environ.get('skey')
+    host = environ.get('host')
+
+    # ikey = 'DIU1PL9B19VR06LX5DWH'
+    # skey = 'oTEsOvzRwiMUh5jUhX8d9nM1CFHDdRkEb5BBd6Yv'
+    # host = 'api-3c52c535.duosecurity.com'
+    ca = DEFAULT_CA_CERTS
+    sig_timezone = 'UTC'
+    sig_version = 2
+
     if not control or not username:
         log('required environment variables not found')
         sys.exit(1)
 
-    def get_config(k):
-        v = environ.get(k)
-        if v:
-            return v
-        else:
-            log('required configuration parameter "{0:s}" not found'.format(k))
-            failure(control)
-
     client = Client(
-        ikey=get_config('ikey'),
-        skey=get_config('skey'),
-        host=get_config('host'),
-        user_agent='duo_openvpn/' + __version__,
+        ikey=ikey,
+        skey=skey,
+        host=host,
+        ca_certs=ca,
+        sig_timezone=sig_timezone,
     )
-    if environ.get('proxy_host'):
-        client.set_proxy(
-            host=get_config('proxy_host'),
-            port=get_config('proxy_port'),
-        )
+    client.sig_version = sig_version
 
-    try:
-        default_factor = preauth(client, control, username)
-    except Exception, e:
-        log(str(e))
+    params = collections.defaultdict(list)
+    params['username'] = [username]
+
+    (response, data) = client.api_call('POST', '/auth/v2/preauth', params)
+    if response.status == 200 and json.loads(data)['response']['result'] == 'auth' and 'push' in json.loads(data)['response']['devices'][0]['capabilities']:
+        params = collections.defaultdict(list)
+        params['username'] = [username]
+        params['factor'] = ['push']
+        params['ipaddr'] = [ipaddr]
+        params['device'] = json.loads(data)['response']['devices'][0]['device']
+        params['async'] = ['1']
+        (response, data) = client.api_call('POST', '/auth/v2/auth', params)
+        if response.status == 200:
+            log('Push notification sent to \'{}\''.format(username))
+            params = collections.defaultdict(list)
+            params['txid'] = [json.loads(data)['response']['txid']]
+            error = 0
+            while True:
+                (response, data) = client.api_call(
+                    'GET', '/auth/v2/auth_status', params)
+                if response.status == 200:
+                    if json.loads(data)['response']['result'] == 'allow':
+                        log('\'{}\' authenticated'.format(username))
+                        success(control)
+                        break
+                    elif json.loads(data)['response']['result'] == 'deny':
+                        log('\'{}\' failed authentication, reason: {}'.format(
+                            username, json.loads(data)['response']['status']))
+                        failure(control)
+                        break
+                    log('Still waiting to authenticate \'{}\', reason: {}'.format(
+                        username, json.loads(data)['response']['status']))
+                else:
+                    log('Something went wrong authentication \'{}\', debug: {}'.format(
+                        username, json.loads(data)['response']))
+                    error += 1
+                    if error == 5:
+                        log('Too many errors trying to authenticate \'{}\', I give up'.format(
+                            username))
+                        failure(control)
+                        break
+        else:
+            log('Auth failed for \'{}\', debug: {}'.format(
+                username, json.loads(data)['response']))
+            failure(control)
+    else:
+        log('Preauth failed for \'{}\', debug: {}'.format(
+            username, json.loads(data)['response']))
         failure(control)
 
-    if not (password or default_factor):
-        log('no password provided and no out-of-band factors '
-            'available for username {0:s}'.format(username))
-        failure(control)
-    elif not password:
-        password = default_factor
-
-    try:
-        auth(client, control, username, password, ipaddr)
-    except Exception, e:
-        log(str(e))
-        failure(control)
-
-    failure(control)
 
 if __name__ == '__main__':
     main()
